@@ -1,10 +1,10 @@
-# MalSight — Complete Project Document
+# IntelliGuard — Complete Project Document
 
 ---
 
-## What Is MalSight
+## What Is IntelliGuard
 
-MalSight is a background-running Windows application that watches a folder you choose, analyzes any new executable files using AI, and sends you a Windows notification if malware is detected — telling you exactly why it flagged the file and what type of malware it likely is.
+IntelliGuard is a background-running Windows application that watches a folder you choose, analyzes any new executable files using AI, and sends you a Windows notification if malware is detected — telling you exactly why it flagged the file and what type of malware it likely is.
 
 It works like an antivirus running silently in the background, but instead of matching files against a known database, it uses machine learning to detect malware based on the file's structure and behavior patterns. This means it can detect new malware it has never seen before.
 
@@ -12,7 +12,7 @@ It works like an antivirus running silently in the background, but instead of ma
 
 ## The Problem Being Solved
 
-Traditional antivirus software works by comparing files against a database of known malware signatures. If malware is new or slightly modified, it gets through. MalSight solves this by learning the patterns of malicious behavior — structure, strings, API calls, entropy — so it can flag unknown threats too. It also explains every decision so you know exactly why something was flagged, not just that it was.
+Traditional antivirus software works by comparing files against a database of known malware signatures. If malware is new or slightly modified, it gets through. IntelliGuard solves this by learning the patterns of malicious behavior — structure, strings, API calls, entropy — so it can flag unknown threats too. It also explains every decision so you know exactly why something was flagged, not just that it was.
 
 ---
 
@@ -21,7 +21,7 @@ Traditional antivirus software works by comparing files against a database of kn
 ```
 You drop a file into your watched folder
               ↓
-MalSight detects it automatically
+IntelliGuard detects it automatically
               ↓
 AI analyzes the file silently (no execution needed)
               ↓
@@ -29,7 +29,7 @@ If clean → logged quietly, no interruption
 If malware → Windows notification appears:
 
 ┌──────────────────────────────────────────┐
-│  ⚠️  MalSight Alert                      │
+│  ⚠️  IntelliGuard Alert                      │
 │  File:    suspicious.exe                 │
 │  Verdict: MALWARE (94% confidence)       │
 │  Type:    Likely Ransomware              │
@@ -272,7 +272,7 @@ If models disagree significantly → flagged for manual review
 ## Project Structure
 
 ```
-malsight\
+intelliguard\
 │
 ├── data\
 │   ├── raw\
@@ -305,7 +305,7 @@ malsight\
 ├── .gitignore
 ├── config.yaml              ← all project settings
 ├── requirements.txt         ← all packages
-└── main.py                  ← start MalSight from here
+└── main.py                  ← start IntelliGuard from here
 ```
 
 ---
@@ -376,7 +376,7 @@ STEP 19 → Main runner
           Ties everything together, runs in background
 
 STEP 20 → Startup script
-          Optional: run MalSight on Windows boot
+          Optional: run IntelliGuard on Windows boot
 ```
 
 ---
