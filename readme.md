@@ -415,7 +415,7 @@ Optimizations applied:
   RobustScaler handles extreme malware feature values
   XGBoost uses NVIDIA GPU (tree_method=hist, device=cuda)
   n_jobs=4 for sklearn (safer than -1 on Windows)
-  RAM monitored after every major processing step
+  RAM monitored after every major processing step    
   Variables deleted and garbage collected after each chunk
 ```
 
