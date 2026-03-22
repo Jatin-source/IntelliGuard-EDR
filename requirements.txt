@@ -1,0 +1,25 @@
+# Core Data & ML
+numpy
+pandas
+scipy
+scikit-learn
+xgboost
+imbalanced-learn
+optuna
+shap
+
+# File Analysis & Watching
+pefile
+watchdog
+win10toast
+
+# Visualization
+matplotlib
+seaborn
+
+# Utils
+pyyaml
+python-dotenv
+pyarrow
+fastparquet
+psutil

@@ -1,0 +1,30 @@
+# config.yaml
+project:
+  name: "MalSight"
+  version: "1.0.0"
+
+paths:
+  # Where the original data lives
+  raw_data:
+    kaggle: "data/raw/kaggle"
+    ember: "data/raw/ember"
+    bodmas: "data/raw/bodmas"
+    cic: "data/raw/cic"
+  
+  # Where we save cleaned and processed data
+  processed_data:
+    static: "data/processed/static"
+    dynamic: "data/processed/dynamic"
+    splits: "data/processed/splits"
+  
+  # Where we save our final outputs
+  outputs:
+    models: "outputs/models"
+    scalers: "outputs/scalers"
+    metrics: "outputs/metrics"
+
+model_settings:
+  test_size: 0.15
+  val_size: 0.15
+  random_seed: 42
+  target_column: "label" # 1 for malware, 0 for benign

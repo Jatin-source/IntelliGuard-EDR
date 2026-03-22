@@ -1,6 +1,6 @@
 """
 IntelliGuard — AI Threat Intelligence Platform
-Upgraded UI/UX: Enterprise Cyberpunk Edition
+Rewritten: Performance + Accuracy + Background Service Edition
 Place this file at:  malSight/main.py
 Run with:           python main.py  (from inside malSight/)
 """
@@ -19,6 +19,14 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from plyer import notification
 
+# ── Optional tray icon support ─────────────────────────────────────────────
+try:
+    import pystray
+    from PIL import Image as PILImage, ImageDraw
+    TRAY_AVAILABLE = True
+except ImportError:
+    TRAY_AVAILABLE = False
+
 # ── Ensure project root is on sys.path ─────────────────────────────────────
 _project_root = str(Path(__file__).resolve().parent)
 if _project_root not in sys.path:
@@ -30,168 +38,138 @@ from src.detector.ensemble import IntelliGuardEnsemble
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
-# ── Palette (single source of truth) ────────────────────────────────────────
 C = {
-    "bg_deep":    "#0d0d12",   # deepest background
-    "bg_mid":     "#13131a",   # panels
-    "bg_card":    "#1a1a24",   # cards / sidebar
-    "bg_hover":   "#22222e",   # hover state
-    "border":     "#2a2a3a",   # subtle borders
-    "accent":     "#00e5ff",   # cyan accent
-    "accent2":    "#7b2fff",   # purple accent
-    "green":      "#00ff88",   # safe / ok
-    "amber":      "#ffb300",   # warning / booting
-    "red":        "#ff3b5c",   # danger / malware
-    "txt_pri":    "#e8e8f0",   # primary text
-    "txt_sec":    "#6b6b8a",   # secondary / muted
-    "txt_mono":   "#00e5ff",   # terminal text
+    "bg_deep":    "#080b0f",
+    "bg_mid":     "#0e1117",
+    "bg_card":    "#141820",
+    "bg_hover":   "#1c2230",
+    "border":     "#1e2535",
+    "border2":    "#2a3548",
+    "accent":     "#00d4ff",
+    "accent2":    "#6c3fff",
+    "green":      "#00e676",
+    "amber":      "#ffc107",
+    "red":        "#ff1744",
+    "red_dim":    "#cc0033",
+    "txt_pri":    "#dde3f0",
+    "txt_sec":    "#55647a",
+    "txt_mono":   "#4fc3f7",
+    "safe_glow":  "#00e676",
+    "danger_glow":"#ff1744",
 }
 
-# ── Fonts (lazy — created on first access, always after Tk root exists) ─────
 _FONTS: dict = {}
 
 def _f(key: str) -> ctk.CTkFont:
-    """Return a cached CTkFont. Safe to call any time after CTk() is created."""
     if key not in _FONTS:
         _FONTS[key] = {
-            "title":   lambda: ctk.CTkFont(family="Consolas", size=22, weight="bold"),
-            "head":    lambda: ctk.CTkFont(family="Consolas", size=14, weight="bold"),
+            "title":   lambda: ctk.CTkFont(family="Consolas", size=20, weight="bold"),
+            "head":    lambda: ctk.CTkFont(family="Consolas", size=13, weight="bold"),
             "body":    lambda: ctk.CTkFont(family="Consolas", size=12),
-            "mono":    lambda: ctk.CTkFont(family="Consolas", size=12),
-            "huge":    lambda: ctk.CTkFont(family="Consolas", size=72, weight="bold"),
-            "verdict": lambda: ctk.CTkFont(family="Consolas", size=24, weight="bold"),
-            "label":   lambda: ctk.CTkFont(family="Consolas", size=11),
-            "btn":     lambda: ctk.CTkFont(family="Consolas", size=13, weight="bold"),
+            "mono":    lambda: ctk.CTkFont(family="Consolas", size=11),
+            "huge":    lambda: ctk.CTkFont(family="Consolas", size=64, weight="bold"),
+            "verdict": lambda: ctk.CTkFont(family="Consolas", size=22, weight="bold"),
+            "label":   lambda: ctk.CTkFont(family="Consolas", size=10),
+            "btn":     lambda: ctk.CTkFont(family="Consolas", size=12, weight="bold"),
+            "score":   lambda: ctk.CTkFont(family="Consolas", size=16, weight="bold"),
         }[key]()
     return _FONTS[key]
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  ANIMATED CANVAS WIDGETS
+#  RADAR CANVAS  (optimised: reuse items via coords, not delete/recreate)
 # ════════════════════════════════════════════════════════════════════════════
 
 class RadarCanvas(tk.Canvas):
-    """A rotating radar sweep animation rendered on a tk.Canvas."""
+    """Rotating radar sweep — uses item-tag move instead of full redraw."""
 
-    def __init__(self, master, size=160, **kwargs):
+    TRAIL_STEPS = 12   # fewer trail lines = faster
+    FPS_MS      = 80   # 12.5 fps is plenty for a radar animation
 
-        # allow external bg override but avoid duplicate argument
-        bg_color = kwargs.pop("bg", C["bg_mid"])
-
-        super().__init__(
-            master,
-            width=size,
-            height=size,
-            bg=bg_color,
-            highlightthickness=0,
-            **kwargs
-        )
-
-        self.size   = size
-        self.cx     = size // 2
-        self.cy     = size // 2
-        self.r      = (size // 2) - 10
-        self.angle  = 0
+    def __init__(self, master, size=150, **kwargs):
+        bg = kwargs.pop("bg", C["bg_mid"])
+        super().__init__(master, width=size, height=size,
+                         bg=bg, highlightthickness=0, **kwargs)
+        self.size = size
+        self.cx   = size // 2
+        self.cy   = size // 2
+        self.r    = size // 2 - 8
+        self.angle = 0
         self._active = False
-        self._draw_idle()
+        self._after_id = None
+        self._build_static()
+        self._build_sweep()
 
-    # ── static idle state ──────────────────────────────────────────────────
-    def _draw_idle(self):
-        self.delete("all")
-        # Concentric rings
+    def _build_static(self):
+        """Draw rings and crosshairs once; keep their IDs."""
+        cx, cy, r = self.cx, self.cy, self.r
         for i in range(1, 4):
-            ratio = i / 3
-            r = int(self.r * ratio)
-            self.create_oval(
-                self.cx - r, self.cy - r,
-                self.cx + r, self.cy + r,
-                outline=C["border"], width=1
-            )
-        # Cross-hairs
-        self.create_line(self.cx, self.cy - self.r,
-                         self.cx, self.cy + self.r,
-                         fill=C["border"], width=1)
-        self.create_line(self.cx - self.r, self.cy,
-                         self.cx + self.r, self.cy,
-                         fill=C["border"], width=1)
-        # Centre dot
-        self.create_oval(self.cx-3, self.cy-3, self.cx+3, self.cy+3,
-                         fill=C["accent"], outline="")
+            ri = int(r * i / 3)
+            self.create_oval(cx-ri, cy-ri, cx+ri, cy+ri,
+                             outline=C["border2"], width=1, tags="static")
+        self.create_line(cx, cy-r, cx, cy+r, fill=C["border2"], width=1, tags="static")
+        self.create_line(cx-r, cy, cx+r, cy, fill=C["border2"], width=1, tags="static")
+        self.create_oval(cx-3, cy-3, cx+3, cy+3,
+                         fill=C["accent"], outline="", tags="dot")
 
-    # ── animated sweep ─────────────────────────────────────────────────────
+    def _build_sweep(self):
+        """Create trail lines and leading arm as canvas items (updated each frame)."""
+        cx, cy = self.cx, self.cy
+        self._trail_ids = []
+        for _ in range(self.TRAIL_STEPS):
+            lid = self.create_line(cx, cy, cx, cy, fill=C["border"], width=1)
+            self._trail_ids.append(lid)
+        self._arm_id = self.create_line(cx, cy, cx, cy,
+                                        fill=C["accent"], width=2)
+
+    @staticmethod
+    def _blend(hex1, hex2, t):
+        r1,g1,b1 = int(hex1[1:3],16),int(hex1[3:5],16),int(hex1[5:7],16)
+        r2,g2,b2 = int(hex2[1:3],16),int(hex2[3:5],16),int(hex2[5:7],16)
+        return f"#{int(r1+(r2-r1)*t):02x}{int(g1+(g2-g1)*t):02x}{int(b1+(b2-b1)*t):02x}"
+
     def start(self):
         self._active = True
         self._sweep()
 
     def stop(self):
         self._active = False
-        self._draw_idle()
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        # Hide sweep lines
+        cx, cy = self.cx, self.cy
+        for lid in self._trail_ids:
+            self.coords(lid, cx, cy, cx, cy)
+        self.coords(self._arm_id, cx, cy, cx, cy)
 
     def _sweep(self):
         if not self._active:
             return
-        self.delete("all")
-        # Rings
-        for i in range(1, 4):
-            ratio = i / 3
-            r = int(self.r * ratio)
-            self.create_oval(
-                self.cx - r, self.cy - r,
-                self.cx + r, self.cy + r,
-                outline=C["border"], width=1
-            )
-        # Cross-hairs
-        self.create_line(self.cx, self.cy - self.r,
-                         self.cx, self.cy + self.r,
-                         fill=C["border"], width=1)
-        self.create_line(self.cx - self.r, self.cy,
-                         self.cx + self.r, self.cy,
-                         fill=C["border"], width=1)
+        cx, cy, r = self.cx, self.cy, self.r
+        N = self.TRAIL_STEPS
+        for i, lid in enumerate(self._trail_ids):
+            a = math.radians(self.angle - (N - i) * 3)
+            x = cx + r * math.cos(a)
+            y = cy - r * math.sin(a)
+            t = i / N
+            self.coords(lid, cx, cy, x, y)
+            self.itemconfig(lid, fill=self._blend(C["accent"], C["bg_mid"], 1 - t))
+        arm_rad = math.radians(self.angle)
+        ax = cx + r * math.cos(arm_rad)
+        ay = cy - r * math.sin(arm_rad)
+        self.coords(self._arm_id, cx, cy, ax, ay)
+        self.tag_raise("dot")
+        self.angle = (self.angle + 5) % 360
+        self._after_id = self.after(self.FPS_MS, self._sweep)
 
-        # Sweep gradient (arc segments trailing behind the arm)
-        TRAIL = 60
-        for i in range(TRAIL, 0, -1):
-            alpha = int(180 * (i / TRAIL))          # simulate opacity via colour
-            trail_angle = self.angle - i
-            rad = math.radians(trail_angle)
-            x_end = self.cx + self.r * math.cos(rad)
-            y_end = self.cy - self.r * math.sin(rad)
-            # Use a slightly transparent-looking colour by blending toward bg
-            self.create_line(
-                self.cx, self.cy, x_end, y_end,
-                fill=self._blend(C["accent"], C["bg_mid"], i / TRAIL),
-                width=1
-            )
 
-        # Leading sweep arm
-        rad = math.radians(self.angle)
-        x_end = self.cx + self.r * math.cos(rad)
-        y_end = self.cy - self.r * math.sin(rad)
-        self.create_line(self.cx, self.cy, x_end, y_end,
-                         fill=C["accent"], width=2)
-
-        # Centre dot
-        self.create_oval(self.cx-3, self.cy-3, self.cx+3, self.cy+3,
-                         fill=C["accent"], outline="")
-
-        self.angle = (self.angle + 3) % 360
-        self.after(30, self._sweep)   # ~33 fps, smooth & cheap
-
-    @staticmethod
-    def _blend(hex1: str, hex2: str, t: float) -> str:
-        """Linearly blend two hex colours. t=0 → hex1, t=1 → hex2."""
-        r1, g1, b1 = int(hex1[1:3],16), int(hex1[3:5],16), int(hex1[5:7],16)
-        r2, g2, b2 = int(hex2[1:3],16), int(hex2[3:5],16), int(hex2[5:7],16)
-        r = int(r1 + (r2-r1)*t)
-        g = int(g1 + (g2-g1)*t)
-        b = int(b1 + (b2-b1)*t)
-        return f"#{r:02x}{g:02x}{b:02x}"
-
+# ════════════════════════════════════════════════════════════════════════════
+#  PULSING DOT  (throttled to 150ms)
+# ════════════════════════════════════════════════════════════════════════════
 
 class PulsingDot(tk.Canvas):
-    """Tiny pulsing status indicator (like a heart-beat LED)."""
-
-    def __init__(self, master, color=C["amber"], size=14, **kwargs):
+    def __init__(self, master, color=C["amber"], size=12, **kwargs):
         super().__init__(master, width=size, height=size,
                          bg=C["bg_card"], highlightthickness=0, **kwargs)
         self._color  = color
@@ -204,124 +182,201 @@ class PulsingDot(tk.Canvas):
         self._color = color
 
     def _pulse(self):
-        # Oscillate between 0.4 and 1.0 scale
-        if self._growing:
-            self._scale = min(1.0, self._scale + 0.06)
-            if self._scale >= 1.0:
-                self._growing = False
-        else:
-            self._scale = max(0.4, self._scale - 0.06)
-            if self._scale <= 0.4:
-                self._growing = True
-
-        self.delete("all")
+        self._growing = not self._growing if self._scale >= 1.0 or self._scale <= 0.45 else self._growing
+        self._scale += 0.1 if self._growing else -0.1
+        self._scale = max(0.45, min(1.0, self._scale))
         half = self._size / 2
-        r    = half * self._scale
+        r = half * self._scale
+        self.delete("all")
         self.create_oval(half-r, half-r, half+r, half+r,
                          fill=self._color, outline="")
-        self.after(60, self._pulse)
+        self.after(150, self._pulse)   # 150ms — was 60ms
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  STAT CARD (small metric tiles in the header bar)
+#  STAT CARD
 # ════════════════════════════════════════════════════════════════════════════
 
 class StatCard(ctk.CTkFrame):
     def __init__(self, master, label: str, value: str, accent: str, **kwargs):
-        super().__init__(master,
-                         fg_color=C["bg_card"],
-                         corner_radius=8,
-                         border_width=1,
-                         border_color=C["border"],
-                         **kwargs)
-        ctk.CTkLabel(self, text=label,
-                     font=_f("label"),
-                     text_color=C["txt_sec"]).pack(pady=(10, 0))
-        self.value_lbl = ctk.CTkLabel(self, text=value,
-                                      font=ctk.CTkFont(family="Consolas", size=18, weight="bold"),
-                                      text_color=accent)
-        self.value_lbl.pack(pady=(2, 10))
+        super().__init__(master, fg_color=C["bg_card"],
+                         corner_radius=6, border_width=1,
+                         border_color=C["border2"], **kwargs)
+        ctk.CTkLabel(self, text=label, font=_f("label"),
+                     text_color=C["txt_sec"]).pack(pady=(8, 0), padx=12)
+        self.value_lbl = ctk.CTkLabel(
+            self, text=value,
+            font=ctk.CTkFont(family="Consolas", size=16, weight="bold"),
+            text_color=accent)
+        self.value_lbl.pack(pady=(2, 8))
 
     def update_value(self, value: str):
         self.value_lbl.configure(text=value)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  VOTE INDICATOR ROW
+#  VOTE ROW  (animation via after() chain — never blocks UI)
 # ════════════════════════════════════════════════════════════════════════════
 
 class VoteRow(ctk.CTkFrame):
     def __init__(self, master, model_name: str, **kwargs):
-        super().__init__(master,
-                         fg_color=C["bg_card"],
-                         corner_radius=6,
-                         border_width=1,
-                         border_color=C["border"],
-                         **kwargs)
-        self.configure(height=36)
+        super().__init__(master, fg_color=C["bg_card"],
+                         corner_radius=5, border_width=1,
+                         border_color=C["border"], **kwargs)
+        self.configure(height=34)
 
-        self.name_lbl = ctk.CTkLabel(self, text=f"► {model_name}",
-                                     font=_f("mono"),
-                                     text_color=C["txt_sec"],
-                                     width=160, anchor="w")
-        self.name_lbl.pack(side="left", padx=(12, 0))
+        self.name_lbl = ctk.CTkLabel(self, text=f"▸ {model_name}",
+                                     font=_f("mono"), text_color=C["txt_sec"],
+                                     width=150, anchor="w")
+        self.name_lbl.pack(side="left", padx=(10, 0))
 
-        self.verdict_lbl = ctk.CTkLabel(self, text="PENDING",
-                                        font=_f("mono"),
-                                        text_color=C["txt_sec"],
-                                        width=90)
-        self.verdict_lbl.pack(side="left", padx=8)
+        self.verdict_lbl = ctk.CTkLabel(self, text="WAITING",
+                                        font=_f("mono"), text_color=C["txt_sec"],
+                                        width=80)
+        self.verdict_lbl.pack(side="left", padx=6)
 
-        self.bar = ctk.CTkProgressBar(self, width=180, height=6,
+        self.bar = ctk.CTkProgressBar(self, width=160, height=5,
                                       fg_color=C["border"],
                                       progress_color=C["txt_sec"])
         self.bar.set(0)
-        self.bar.pack(side="left", padx=8)
+        self.bar.pack(side="left", padx=6)
 
         self.conf_lbl = ctk.CTkLabel(self, text="--.--%",
-                                     font=_f("label"),
-                                     text_color=C["txt_sec"],
-                                     width=60)
-        self.conf_lbl.pack(side="left", padx=(4, 12))
+                                     font=_f("label"), text_color=C["txt_sec"],
+                                     width=55)
+        self.conf_lbl.pack(side="left", padx=(4, 10))
 
-    def animate_result(self, is_malware: bool, confidence: float, delay_ms: int = 0):
-        """Animate the bar and label after `delay_ms` ms."""
-        color  = C["red"] if is_malware else C["green"]
-        label  = "MALWARE" if is_malware else "SAFE"
+        self.cov_lbl = ctk.CTkLabel(self, text="",
+                                    font=_f("label"), text_color=C["txt_sec"],
+                                    width=60)
+        self.cov_lbl.pack(side="left", padx=(0, 8))
 
-        def _run():
+    def animate_result(self, is_malware: bool, confidence: float,
+                       match_ratio: float = 1.0, delay_ms: int = 0):
+        color = C["red"] if is_malware else C["green"]
+        label = "MALWARE" if is_malware else "SAFE"
+        cov   = f"cov:{match_ratio*100:.0f}%"
+
+        def _start():
             self.verdict_lbl.configure(text=label, text_color=color)
             self.bar.configure(progress_color=color)
             self.conf_lbl.configure(text=f"{confidence*100:.1f}%", text_color=color)
-            # Animate bar from 0 → confidence
-            steps = 20
-            for i in range(1, steps + 1):
-                val = (confidence / steps) * i
-                self.bar.set(val)
-                time.sleep(0.02)
+            self.cov_lbl.configure(text=cov, text_color=C["txt_sec"])
+            self._animate_bar(0, 18, confidence)   # 18 steps was 20
 
-        def _after():
-            threading.Thread(target=_run, daemon=True).start()
+        self.after(delay_ms, _start)
 
-        self.after(delay_ms, _after)
+    def set_skipped(self, delay_ms: int = 0):
+        def _start():
+            self.verdict_lbl.configure(text="SKIPPED", text_color=C["amber"])
+            self.conf_lbl.configure(text="N/A", text_color=C["amber"])
+        self.after(delay_ms, _start)
+
+    def set_trusted(self, delay_ms: int = 0):
+        def _start():
+            self.verdict_lbl.configure(text="TRUSTED", text_color=C["green"])
+            self.bar.set(0)
+            self.bar.configure(progress_color=C["green"])
+            self.conf_lbl.configure(text="--", text_color=C["green"])
+        self.after(delay_ms, _start)
+
+    def _animate_bar(self, step, total, target):
+        if step > total:
+            return
+        self.bar.set((target / total) * step)
+        self.after(25, lambda: self._animate_bar(step + 1, total, target))
 
     def reset(self):
-        self.verdict_lbl.configure(text="PENDING", text_color=C["txt_sec"])
+        self.verdict_lbl.configure(text="WAITING", text_color=C["txt_sec"])
         self.bar.set(0)
         self.bar.configure(progress_color=C["txt_sec"])
-        self.conf_lbl.configure(text="--.--% ", text_color=C["txt_sec"])
+        self.conf_lbl.configure(text="--.--%", text_color=C["txt_sec"])
+        self.cov_lbl.configure(text="")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  DOWNLOAD WATCHER
+# ════════════════════════════════════════════════════════════════════════════
+
+_TEMP_EXT      = {'.crdownload', '.tmp', '.partial', '.downloading', '.part', '.download'}
+_SCAN_EXT      = {'.exe', '.dll', '.sys', '.msi', '.scr', '.bat', '.cmd', '.com', '.pif',
+                  '.vbs', '.ps1', '.jar', '.hta', '.wsf'}
 
 
 class DownloadHandler(FileSystemEventHandler):
     def __init__(self, app):
         super().__init__()
-        self.app = app
+        self.app     = app
+        self._pending = set()
+        self._lock    = threading.Lock()
 
     def on_created(self, event):
         if not event.is_directory:
-            ext = os.path.splitext(event.src_path)[1].lower()
-            if ext in ['.exe', '.dll', '.sys', '.msi']:
-                self.app.queue_scan(event.src_path)
+            self._check(event.src_path)
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self._check(event.dest_path)
+
+    def _check(self, path: str):
+        ext = os.path.splitext(path)[1].lower()
+        if ext in _TEMP_EXT:
+            return
+        if ext in _SCAN_EXT:
+            self._wait_and_queue(path)
+
+    def _wait_and_queue(self, file_path: str):
+        with self._lock:
+            if file_path in self._pending:
+                return
+            self._pending.add(file_path)
+
+        def _worker():
+            try:
+                prev_size = -1
+                stable = 0
+                for _ in range(120):        # max 60 s
+                    try:
+                        cur = os.path.getsize(file_path)
+                    except OSError:
+                        time.sleep(0.5)
+                        continue
+                    if cur == prev_size and cur > 0:
+                        stable += 1
+                        if stable >= 3:
+                            break
+                    else:
+                        stable = 0
+                    prev_size = cur
+                    time.sleep(0.5)
+                # Confirm readable
+                try:
+                    with open(file_path, 'rb') as f:
+                        f.read(1)
+                except (OSError, PermissionError):
+                    return
+                self.app.queue_scan(file_path, auto=True)
+            finally:
+                with self._lock:
+                    self._pending.discard(file_path)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  SYSTEM TRAY  (minimise to tray, restore on click)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _make_tray_icon():
+    """Create a small cyan shield icon for the system tray."""
+    size = 64
+    img  = PILImage.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    # Shield shape approximation
+    draw.polygon([(32, 4), (58, 16), (58, 36), (32, 60), (6, 36), (6, 16)],
+                 fill=(0, 212, 255, 220), outline=(0, 150, 200, 255))
+    return img
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  MAIN APPLICATION
@@ -330,25 +385,64 @@ class DownloadHandler(FileSystemEventHandler):
 class IntelliGuardApp(ctk.CTk):
 
     def __init__(self):
-        super().__init__()   # ← root window now exists; _f() calls are now safe
-
-        self.title("IntelliGuard  //  AI Threat Intelligence Platform  //  v2.0")
+        super().__init__()
+        self.title("IntelliGuard  //  AI Threat Intelligence  //  v3.0")
         self.geometry("1180x720")
         self.resizable(False, False)
         self.configure(fg_color=C["bg_deep"])
 
-        self.engine      = None
-        self.is_scanning = False
-        self._scan_count = 0
-        self._threat_count = 0
-        self.scan_queue = queue.Queue()
+        self.engine         = None
+        self.is_scanning    = False
+        self._scan_count    = 0
+        self._threat_count  = 0
+        self.scan_queue     = queue.Queue()
+        self._tray          = None
+        self._hidden        = False
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Boot AI in background so UI is snappy
+        # Boot AI in background
         threading.Thread(target=self._initialize_engine, daemon=True).start()
+        # Scan worker
         threading.Thread(target=self._scan_worker, daemon=True).start()
+        # Download watcher
         self._start_background_monitor()
+        # System tray
+        if TRAY_AVAILABLE:
+            threading.Thread(target=self._start_tray, daemon=True).start()
+
+    # ────────────────────────────────────────────────────────────────────────
+    #  CLOSE → MINIMISE TO TRAY
+    # ────────────────────────────────────────────────────────────────────────
+    def _on_close(self):
+        if TRAY_AVAILABLE and self._tray:
+            self.withdraw()
+            self._hidden = True
+        else:
+            self.destroy()
+
+    def _start_tray(self):
+        img  = _make_tray_icon()
+        menu = pystray.Menu(
+            pystray.MenuItem("Open IntelliGuard", self._restore_from_tray, default=True),
+            pystray.MenuItem("Exit",              self._quit_app)
+        )
+        self._tray = pystray.Icon("IntelliGuard", img, "IntelliGuard Active", menu)
+        self._tray.run()
+
+    def _restore_from_tray(self, icon=None, item=None):
+        self.after(0, self._do_restore)
+
+    def _do_restore(self):
+        self.deiconify()
+        self.lift()
+        self._hidden = False
+
+    def _quit_app(self, icon=None, item=None):
+        if self._tray:
+            self._tray.stop()
+        self.after(0, self.destroy)
 
     # ────────────────────────────────────────────────────────────────────────
     #  ENGINE INIT
@@ -357,242 +451,227 @@ class IntelliGuardApp(ctk.CTk):
         self._log("[SYS]  Booting IntelliGuard Core Engine …")
         self.engine = IntelliGuardEnsemble()
         self._log("[SYS]  XGBoost Expert Ensemble loaded  (Kaggle · BODMAS · EMBER)")
-        self._log("[SYS]  Cryptographic Heuristic Layer  →  ACTIVE")
-        self._log("[SYS]  Late-Fusion Voting Module       →  ARMED")
-        self._log("[SYS]  ─────────────────────────────────────────")
+        self._log("[SYS]  Score Calibration Layer          →  ACTIVE")
+        self._log("[SYS]  Majority Vote Gate               →  ARMED")
+        self._log("[SYS]  Late-Fusion Voting Module        →  ARMED")
+        self._log("[SYS]  ─────────────────────────────────────────────")
         self._log("[RDY]  System online. Drop a target to begin.")
-
-        # Update status dot & label safely on main thread
         self.after(0, lambda: self.dot.set_color(C["green"]))
         self.after(0, lambda: self.status_lbl.configure(
-            text="ONLINE", text_color=C["green"]))
+            text="ONLINE  ·  MONITORING", text_color=C["green"]))
         self.after(0, lambda: self.scan_btn.configure(state="normal"))
 
     # ────────────────────────────────────────────────────────────────────────
     #  UI CONSTRUCTION
     # ────────────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        # ── TOP HEADER BAR ─────────────────────────────────────────────────
+        # ── HEADER ─────────────────────────────────────────────────────────
         header = ctk.CTkFrame(self, fg_color=C["bg_card"],
-                              corner_radius=0, height=58,
-                              border_width=1, border_color=C["border"])
+                              corner_radius=0, height=54,
+                              border_width=1, border_color=C["border2"])
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
 
-        # Logo
         ctk.CTkLabel(header, text="⬡ INTELLIGUARD",
-                     font=_f("title"),
-                     text_color=C["accent"]).pack(side="left", padx=24, pady=10)
+                     font=_f("title"), text_color=C["accent"]).pack(
+                     side="left", padx=20, pady=8)
+        ctk.CTkLabel(header, text="AI THREAT INTELLIGENCE PLATFORM  v3.0",
+                     font=_f("label"), text_color=C["txt_sec"]).pack(
+                     side="left", pady=8)
 
-        ctk.CTkLabel(header, text="AI THREAT INTELLIGENCE PLATFORM",
-                     font=_f("label"),
-                     text_color=C["txt_sec"]).pack(side="left", pady=10)
+        stats = ctk.CTkFrame(header, fg_color="transparent")
+        stats.pack(side="right", padx=14, pady=6)
 
-        # Right-side stat cards
-        stats_frame = ctk.CTkFrame(header, fg_color="transparent")
-        stats_frame.pack(side="right", padx=16, pady=8)
+        self.card_scanned = StatCard(stats, "SCANNED", "0", C["accent"])
+        self.card_scanned.pack(side="left", padx=5)
+        self.card_threats = StatCard(stats, "THREATS", "0", C["red"])
+        self.card_threats.pack(side="left", padx=5)
+        self.card_engine  = StatCard(stats, "ENGINE", "XGB ×3", C["accent2"])
+        self.card_engine.pack(side="left", padx=5)
 
-        self.card_scanned = StatCard(stats_frame, "FILES SCANNED", "0",
-                                     C["accent"])
-        self.card_scanned.pack(side="left", padx=6)
-
-        self.card_threats = StatCard(stats_frame, "THREATS FOUND", "0",
-                                     C["red"])
-        self.card_threats.pack(side="left", padx=6)
-
-        self.card_model = StatCard(stats_frame, "ENGINE", "XGBoost ×3",
-                                   C["accent2"])
-        self.card_model.pack(side="left", padx=6)
-
-        # ── BODY (sidebar + main) ───────────────────────────────────────────
+        # ── BODY ───────────────────────────────────────────────────────────
         body = ctk.CTkFrame(self, fg_color="transparent")
-        body.pack(fill="both", expand=True, padx=0, pady=0)
+        body.pack(fill="both", expand=True)
 
-        # ── LEFT SIDEBAR ────────────────────────────────────────────────────
-        sidebar = ctk.CTkFrame(body, width=230, fg_color=C["bg_card"],
+        # ── SIDEBAR ────────────────────────────────────────────────────────
+        sidebar = ctk.CTkFrame(body, width=220, fg_color=C["bg_card"],
                                corner_radius=0,
-                               border_width=1, border_color=C["border"])
+                               border_width=1, border_color=C["border2"])
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
 
         ctk.CTkLabel(sidebar, text="CONTROL PANEL",
                      font=_f("label"), text_color=C["txt_sec"]).pack(
-                     pady=(24, 4), padx=16, anchor="w")
-
-        # Thin accent line
+                     pady=(20, 3), padx=14, anchor="w")
         ctk.CTkFrame(sidebar, height=1, fg_color=C["accent"]).pack(
-            fill="x", padx=16, pady=(0, 18))
+            fill="x", padx=14, pady=(0, 14))
 
         self.scan_btn = ctk.CTkButton(
-            sidebar,
-            text="▸  SELECT TARGET FILE",
+            sidebar, text="▸  SELECT FILE",
             command=self.browse_file,
-            height=44,
-            font=_f("btn"),
-            fg_color=C["accent"],
-            hover_color="#00b8cc",
-            text_color=C["bg_deep"],
-            corner_radius=6,
-            state="disabled"
-        )
-        self.scan_btn.pack(pady=(0, 10), padx=16, fill="x")
+            height=42, font=_f("btn"),
+            fg_color=C["accent"], hover_color="#00aacc",
+            text_color=C["bg_deep"], corner_radius=6, state="disabled")
+        self.scan_btn.pack(pady=(0, 8), padx=14, fill="x")
 
         self.clear_btn = ctk.CTkButton(
-            sidebar,
-            text="↺  CLEAR TERMINAL",
+            sidebar, text="↺  CLEAR LOG",
             command=self._clear_console,
-            height=36,
-            font=_f("btn"),
-            fg_color=C["bg_hover"],
-            hover_color=C["border"],
-            text_color=C["txt_sec"],
-            corner_radius=6,
-            border_width=1,
-            border_color=C["border"]
-        )
-        self.clear_btn.pack(pady=(0, 20), padx=16, fill="x")
+            height=34, font=_f("btn"),
+            fg_color=C["bg_hover"], hover_color=C["border2"],
+            text_color=C["txt_sec"], corner_radius=6,
+            border_width=1, border_color=C["border2"])
+        self.clear_btn.pack(pady=(0, 16), padx=14, fill="x")
 
-        # ── Separator ──────────────────────────────────────────────────────
         ctk.CTkLabel(sidebar, text="EXPERT MODELS",
                      font=_f("label"), text_color=C["txt_sec"]).pack(
-                     pady=(0, 4), padx=16, anchor="w")
-        ctk.CTkFrame(sidebar, height=1, fg_color=C["border"]).pack(
-            fill="x", padx=16, pady=(0, 12))
+                     pady=(0, 3), padx=14, anchor="w")
+        ctk.CTkFrame(sidebar, height=1, fg_color=C["border2"]).pack(
+            fill="x", padx=14, pady=(0, 10))
 
-        # Model tags
-        for name, dataset in [("Expert α", "KAGGLE"), ("Expert β", "BODMAS"), ("Expert γ", "EMBER")]:
-            row = ctk.CTkFrame(sidebar, fg_color=C["bg_mid"], corner_radius=6)
-            row.pack(fill="x", padx=16, pady=3)
+        for name, dataset in [("Expert α", "KAGGLE"),
+                               ("Expert β", "BODMAS"),
+                               ("Expert γ", "EMBER")]:
+            row = ctk.CTkFrame(sidebar, fg_color=C["bg_mid"], corner_radius=5)
+            row.pack(fill="x", padx=14, pady=2)
             ctk.CTkLabel(row, text=name, font=_f("mono"),
-                         text_color=C["accent2"]).pack(side="left", padx=10, pady=6)
+                         text_color=C["accent2"]).pack(side="left", padx=8, pady=5)
             ctk.CTkLabel(row, text=dataset, font=_f("label"),
-                         text_color=C["txt_sec"]).pack(side="right", padx=10)
+                         text_color=C["txt_sec"]).pack(side="right", padx=8)
 
-        # ── Status dot at bottom ────────────────────────────────────────────
-        status_row = ctk.CTkFrame(sidebar, fg_color="transparent")
-        status_row.pack(side="bottom", pady=20, padx=16, anchor="w")
+        # Protections info box
+        ctk.CTkFrame(sidebar, height=1, fg_color=C["border2"]).pack(
+            fill="x", padx=14, pady=(12, 8))
+        ctk.CTkLabel(sidebar, text="ACTIVE PROTECTIONS",
+                     font=_f("label"), text_color=C["txt_sec"]).pack(
+                     padx=14, anchor="w")
+        prot_box = ctk.CTkFrame(sidebar, fg_color=C["bg_mid"], corner_radius=5)
+        prot_box.pack(fill="x", padx=14, pady=(4, 0))
+        for prot in ["Majority Vote Gate", "Score Calibration", "Trusted Publishers",
+                     "System Dir Bypass", "Download Monitor"]:
+            ctk.CTkLabel(prot_box, text=f"  ✓  {prot}", font=_f("label"),
+                         text_color=C["green"], anchor="w").pack(
+                         fill="x", padx=4, pady=1)
 
-        self.dot = PulsingDot(status_row, color=C["amber"])
-        self.dot.pack(side="left", padx=(0, 8))
-
-        self.status_lbl = ctk.CTkLabel(status_row, text="BOOTING …",
-                                       font=_f("mono"),
-                                       text_color=C["amber"])
+        # Status dot
+        s_row = ctk.CTkFrame(sidebar, fg_color="transparent")
+        s_row.pack(side="bottom", pady=16, padx=14, anchor="w")
+        self.dot = PulsingDot(s_row, color=C["amber"])
+        self.dot.pack(side="left", padx=(0, 6))
+        self.status_lbl = ctk.CTkLabel(s_row, text="BOOTING …",
+                                       font=_f("mono"), text_color=C["amber"])
         self.status_lbl.pack(side="left")
 
-        # ── RIGHT MAIN AREA ─────────────────────────────────────────────────
+        # ── MAIN AREA ──────────────────────────────────────────────────────
         main = ctk.CTkFrame(body, fg_color=C["bg_mid"], corner_radius=0)
         main.pack(side="right", fill="both", expand=True)
 
-        # ── TOP HALF: Radar + Verdict ────────────────────────────────────────
-        top_panel = ctk.CTkFrame(main, fg_color="transparent")
-        top_panel.pack(fill="x", padx=24, pady=(20, 10))
+        # ── TOP ROW: radar + verdict ────────────────────────────────────────
+        top = ctk.CTkFrame(main, fg_color="transparent")
+        top.pack(fill="x", padx=20, pady=(16, 8))
 
-        # --- Radar widget ---
-        radar_frame = ctk.CTkFrame(top_panel, fg_color=C["bg_card"],
-                                   corner_radius=10,
-                                   border_width=1, border_color=C["border"])
-        radar_frame.pack(side="left", padx=(0, 16))
+        radar_card = ctk.CTkFrame(top, fg_color=C["bg_card"],
+                                  corner_radius=8,
+                                  border_width=1, border_color=C["border2"])
+        radar_card.pack(side="left", padx=(0, 12))
+        ctk.CTkLabel(radar_card, text="RADAR",
+                     font=_f("label"), text_color=C["txt_sec"]).pack(pady=(8, 2))
+        self.radar = RadarCanvas(radar_card, size=150, bg=C["bg_card"])
+        self.radar.pack(padx=12, pady=(0, 10))
 
-        ctk.CTkLabel(radar_frame, text="SCAN RADAR",
-                     font=_f("label"), text_color=C["txt_sec"]).pack(
-                     pady=(10, 4))
-        self.radar = RadarCanvas(radar_frame, size=160, bg=C["bg_card"])
-        self.radar.pack(padx=16, pady=(0, 12))
+        verdict_card = ctk.CTkFrame(top, fg_color=C["bg_card"],
+                                    corner_radius=8,
+                                    border_width=1, border_color=C["border2"])
+        verdict_card.pack(side="left", fill="both", expand=True)
 
-        # --- Verdict panel ---
-        verdict_frame = ctk.CTkFrame(top_panel, fg_color=C["bg_card"],
-                                     corner_radius=10,
-                                     border_width=1, border_color=C["border"])
-        verdict_frame.pack(side="left", fill="both", expand=True)
-
-        self.verdict_icon = ctk.CTkLabel(verdict_frame, text="◈",
+        self.verdict_icon = ctk.CTkLabel(verdict_card, text="◈",
                                          font=_f("huge"),
-                                         text_color=C["border"])
-        self.verdict_icon.pack(pady=(12, 0))
+                                         text_color=C["border2"])
+        self.verdict_icon.pack(pady=(10, 0))
 
-        self.verdict_lbl = ctk.CTkLabel(verdict_frame,
+        self.verdict_lbl = ctk.CTkLabel(verdict_card,
                                         text="AWAITING TARGET",
                                         font=_f("verdict"),
                                         text_color=C["txt_sec"])
-        self.verdict_lbl.pack(pady=(0, 4))
+        self.verdict_lbl.pack()
 
-        self.file_lbl = ctk.CTkLabel(verdict_frame, text="No file selected",
+        self.file_lbl = ctk.CTkLabel(verdict_card, text="No file selected",
                                      font=_f("label"), text_color=C["txt_sec"])
-        self.file_lbl.pack(pady=(0, 10))
+        self.file_lbl.pack(pady=(2, 0))
 
-        self.elapsed_lbl = ctk.CTkLabel(verdict_frame, text="",
+        self.reason_lbl = ctk.CTkLabel(verdict_card, text="",
+                                       font=_f("label"), text_color=C["txt_sec"],
+                                       wraplength=380)
+        self.reason_lbl.pack(pady=(2, 0))
+
+        self.score_lbl = ctk.CTkLabel(verdict_card, text="",
+                                      font=_f("score"), text_color=C["txt_sec"])
+        self.score_lbl.pack(pady=(2, 0))
+
+        self.elapsed_lbl = ctk.CTkLabel(verdict_card, text="",
                                         font=_f("label"), text_color=C["txt_sec"])
-        self.elapsed_lbl.pack()
+        self.elapsed_lbl.pack(pady=(2, 8))
 
-        # --- Vote rows panel ---
-        votes_outer = ctk.CTkFrame(main, fg_color=C["bg_card"],
-                                   corner_radius=10,
-                                   border_width=1, border_color=C["border"])
-        votes_outer.pack(fill="x", padx=24, pady=(0, 10))
-
-        ctk.CTkLabel(votes_outer, text="ENSEMBLE VOTE BREAKDOWN",
+        # ── VOTE BREAKDOWN ──────────────────────────────────────────────────
+        votes_card = ctk.CTkFrame(main, fg_color=C["bg_card"],
+                                  corner_radius=8,
+                                  border_width=1, border_color=C["border2"])
+        votes_card.pack(fill="x", padx=20, pady=(0, 8))
+        ctk.CTkLabel(votes_card, text="ENSEMBLE VOTE BREAKDOWN",
                      font=_f("label"), text_color=C["txt_sec"]).pack(
-                     pady=(10, 4), padx=16, anchor="w")
-        ctk.CTkFrame(votes_outer, height=1, fg_color=C["border"]).pack(
-            fill="x", padx=16, pady=(0, 8))
+                     pady=(8, 3), padx=14, anchor="w")
+        ctk.CTkFrame(votes_card, height=1, fg_color=C["border2"]).pack(
+            fill="x", padx=14, pady=(0, 6))
 
         self.vote_rows: dict[str, VoteRow] = {}
         for name in ["Expert α  (Kaggle)", "Expert β  (BODMAS)", "Expert γ  (EMBER)"]:
-            vr = VoteRow(votes_outer, model_name=name)
-            vr.pack(fill="x", padx=16, pady=3)
+            vr = VoteRow(votes_card, model_name=name)
+            vr.pack(fill="x", padx=14, pady=2)
             self.vote_rows[name] = vr
-        ctk.CTkFrame(votes_outer, height=0).pack(pady=4)   # bottom padding
+        ctk.CTkFrame(votes_card, height=0).pack(pady=3)
 
         # ── TERMINAL ────────────────────────────────────────────────────────
-        term_header = ctk.CTkFrame(main, fg_color="transparent")
-        term_header.pack(fill="x", padx=24, pady=(0, 4))
-
-        ctk.CTkLabel(term_header, text="SYSTEM TERMINAL",
+        t_header = ctk.CTkFrame(main, fg_color="transparent")
+        t_header.pack(fill="x", padx=20, pady=(0, 3))
+        ctk.CTkLabel(t_header, text="SYSTEM TERMINAL",
                      font=_f("label"), text_color=C["txt_sec"]).pack(side="left")
-
-        # Blinking cursor label (cosmetic)
-        self._cursor_visible = True
-        self.cursor_lbl = ctk.CTkLabel(term_header, text="█",
+        self._cursor_vis = True
+        self.cursor_lbl = ctk.CTkLabel(t_header, text="█",
                                        font=_f("mono"), text_color=C["accent"])
         self.cursor_lbl.pack(side="left", padx=4)
         self._blink_cursor()
 
         self.console = ctk.CTkTextbox(
-            main,
-            font=_f("mono"),
+            main, font=_f("mono"),
             fg_color=C["bg_deep"],
             text_color=C["txt_mono"],
-            border_width=1,
-            border_color=C["border"],
-            corner_radius=8,
-            scrollbar_button_color=C["border"],
+            border_width=1, border_color=C["border2"],
+            corner_radius=6,
+            scrollbar_button_color=C["border2"],
             scrollbar_button_hover_color=C["bg_hover"],
             wrap="word"
         )
-        self.console.pack(fill="both", expand=True, padx=24, pady=(0, 18))
+        self.console.pack(fill="both", expand=True, padx=20, pady=(0, 16))
         self.console.configure(state="disabled")
 
     # ────────────────────────────────────────────────────────────────────────
-    #  CURSOR BLINK  (purely cosmetic)
+    #  CURSOR BLINK
     # ────────────────────────────────────────────────────────────────────────
     def _blink_cursor(self):
-        self._cursor_visible = not self._cursor_visible
-        self.cursor_lbl.configure(
-            text="█" if self._cursor_visible else " ")
-        self.after(530, self._blink_cursor)
+        self._cursor_vis = not self._cursor_vis
+        self.cursor_lbl.configure(text="█" if self._cursor_vis else " ")
+        self.after(600, self._blink_cursor)
 
     # ────────────────────────────────────────────────────────────────────────
-    #  LOGGING  (thread-safe via after())
+    #  LOGGING  (batched via after to avoid flooding the event loop)
     # ────────────────────────────────────────────────────────────────────────
-    def _log(self, text: str, typewriter: bool = False, delay_ms: int = 0):
-        """Append text to the terminal. Safe to call from any thread."""
-        def _plain():
+    def _log(self, text: str, delay_ms: int = 0):
+        def _write():
             self.console.configure(state="normal")
             self.console.insert("end", "\n" + text)
             self.console.see("end")
             self.console.configure(state="disabled")
-        self.after(delay_ms, _plain)
+        self.after(delay_ms, _write)
 
     def _clear_console(self):
         self.console.configure(state="normal")
@@ -600,183 +679,265 @@ class IntelliGuardApp(ctk.CTk):
         self.console.configure(state="disabled")
 
     # ────────────────────────────────────────────────────────────────────────
-    #  FILE BROWSE + SCAN
+    #  BACKGROUND MONITOR
     # ────────────────────────────────────────────────────────────────────────
     def _start_background_monitor(self):
-        downloads_path = os.path.expanduser("~/Downloads")
-        if not os.path.exists(downloads_path):
-            try:
-                os.makedirs(downloads_path)
-            except Exception:
-                pass
+        downloads = os.path.expanduser("~/Downloads")
+        os.makedirs(downloads, exist_ok=True)
+        self.observer = Observer()
+        self.observer.schedule(DownloadHandler(self), downloads, recursive=False)
+        self.observer.start()
+        self.after(2500, lambda: self._log(
+            f"[SYS]  🛡️  Download Monitor ACTIVE → {downloads}"))
+        self.after(2500, lambda: self._log(
+            "[SYS]  Watching: .exe .dll .sys .msi .scr .bat .cmd .com .pif .vbs .ps1 .jar"))
 
-        if os.path.exists(downloads_path):
-            self.observer = Observer()
-            handler = DownloadHandler(self)
-            self.observer.schedule(handler, downloads_path, recursive=False)
-            self.observer.start()
-            self.after(2000, lambda: self._log(f"[SYS]  Real-time protection activated on {downloads_path}"))
-
-    def queue_scan(self, file_path):
-        self.scan_queue.put(file_path)
+    # ────────────────────────────────────────────────────────────────────────
+    #  FILE BROWSE + QUEUE
+    # ────────────────────────────────────────────────────────────────────────
+    def queue_scan(self, file_path: str, auto: bool = False):
         filename = os.path.basename(file_path)
-        self._log(f"[*] Target queued for analysis: {filename}")
+        self.scan_queue.put(file_path)
+        tag = "[AUTO]" if auto else "[MANUAL]"
+        self._log(f"{tag}  Target queued: {filename}")
 
     def _scan_worker(self):
         while True:
             file_path = self.scan_queue.get()
             while self.is_scanning:
-                time.sleep(1)
-            
+                time.sleep(0.3)
             self.is_scanning = True
             self._run_scan(file_path)
 
     def browse_file(self):
         fp = filedialog.askopenfilename(
             title="Select Binary to Analyse",
-            filetypes=[("Executable", "*.exe"), ("DLL", "*.dll"), ("All files", "*.*")]
+            filetypes=[("Executable", "*.exe"), ("DLL", "*.dll"),
+                       ("All scannable", "*.exe *.dll *.sys *.msi *.bat *.cmd"),
+                       ("All files", "*.*")]
         )
         if fp:
             self.queue_scan(fp)
 
+    # ────────────────────────────────────────────────────────────────────────
+    #  RUN SCAN
+    # ────────────────────────────────────────────────────────────────────────
     def _run_scan(self, file_path: str):
         filename = os.path.basename(file_path)
-        fsize    = os.path.getsize(file_path)
+        try:
+            fsize = os.path.getsize(file_path)
+        except OSError:
+            fsize = 0
         self.last_scanned_file = filename
 
         # ── Reset UI ──────────────────────────────────────────────────────
-        self.after(0, lambda: self.scan_btn.configure(
-            state="disabled", text="⚙  ANALYSING …"))
-        self.after(0, lambda: self.verdict_icon.configure(
-            text="◌", text_color=C["amber"]))
-        self.after(0, lambda: self.verdict_lbl.configure(
-            text="EXTRACTING FEATURES …", text_color=C["amber"]))
-        self.after(0, lambda: self.file_lbl.configure(
-            text=filename, text_color=C["txt_sec"]))
-        self.after(0, lambda: self.elapsed_lbl.configure(text=""))
-        self.after(0, lambda: [vr.reset() for vr in self.vote_rows.values()])
-        self.after(0, self.radar.start)
-        self.after(0, lambda: self.dot.set_color(C["amber"]))
-        self.after(0, lambda: self.status_lbl.configure(
-            text="SCANNING", text_color=C["amber"]))
+        def _reset_ui():
+            self.scan_btn.configure(state="disabled", text="⚙  ANALYSING …")
+            self.verdict_icon.configure(text="◌", text_color=C["amber"])
+            self.verdict_lbl.configure(text="SCANNING …", text_color=C["amber"])
+            self.file_lbl.configure(text=filename, text_color=C["txt_sec"])
+            self.reason_lbl.configure(text="")
+            self.score_lbl.configure(text="")
+            self.elapsed_lbl.configure(text="")
+            for vr in self.vote_rows.values():
+                vr.reset()
+            self.radar.start()
+            self.dot.set_color(C["amber"])
+            self.status_lbl.configure(text="SCANNING", text_color=C["amber"])
+        self.after(0, _reset_ui)
 
         # ── Log header ────────────────────────────────────────────────────
-        self._log("", delay_ms=0)
-        self._log("┌─────────────────────────────────────────────────┐")
-        self._log(f"│  TARGET   : {filename[:44]:<44} │")
-        self._log(f"│  SIZE     : {fsize:,} bytes{'':<36} │")
-        self._log("│  ENGINE   : XGBoost Ensemble (Kaggle·BODMAS·EMBER) │")
-        self._log("└─────────────────────────────────────────────────┘")
-        self._log("[*] Parsing PE headers …", delay_ms=50)
-        self._log("[*] Running Cryptographic Heuristic Layer …", delay_ms=100)
+        self._log("")
+        self._log(f"┌──── TARGET ────────────────────────────────────────")
+        self._log(f"│  {filename[:52]}")
+        self._log(f"│  Size: {fsize:,} bytes")
+        self._log(f"└────────────────────────────────────────────────────")
+        self._log("[*]  Extracting PE features …")
 
-        # ── Call backend ──────────────────────────────────────────────────
-        t0     = time.time()
-        result = self.engine.scan_file(file_path)
+        # ── Run backend ───────────────────────────────────────────────────
+        t0      = time.time()
+        result  = self.engine.scan_file(file_path)
         elapsed = time.time() - t0
 
         self.after(0, self.radar.stop)
 
-        # ── Process result ────────────────────────────────────────────────
         if result.get("status") == "error":
-            self._log(f"[ERR] {result.get('message')}", typewriter=True, delay_ms=200)
-            self.after(300, lambda: self.verdict_icon.configure(
+            self._log(f"[ERR] {result.get('message')}", delay_ms=100)
+            self.after(200, lambda: self.verdict_icon.configure(
                 text="⚠", text_color=C["amber"]))
-            self.after(300, lambda: self.verdict_lbl.configure(
+            self.after(200, lambda: self.verdict_lbl.configure(
                 text="ANALYSIS FAILED", text_color=C["amber"]))
-            self.after(300, lambda: self.dot.set_color(C["amber"]))
-            self.after(300, lambda: self.status_lbl.configure(
+            self.after(200, lambda: self.dot.set_color(C["amber"]))
+            self.after(200, lambda: self.status_lbl.configure(
                 text="ERROR", text_color=C["amber"]))
+            self.after(800, lambda: self.scan_btn.configure(
+                state="normal", text="▸  SELECT FILE"))
+            self.after(800, lambda: setattr(self, "is_scanning", False))
+            return
+
+        votes   = result.get("votes", {})
+        verdict = result.get("verdict", "UNKNOWN")
+        trusted = result.get("trusted_publisher", False)
+        fused   = result.get("fused_score", 0.0)
+        reason  = result.get("verdict_reason", "")
+        is_signed = result.get("is_signed", False)
+        signer  = result.get("signer", "")
+
+        # ── Log signature info ────────────────────────────────────────────
+        if is_signed:
+            self._log(f"[SIG]  🔏 Signed by: {signer[:60]}")
         else:
-            votes   = result.get("votes", {})
-            verdict = result.get("verdict")
+            self._log("[SIG]  ⚠️  No valid digital signature")
 
-            # Map backend keys → our VoteRow names (order must match)
-            row_keys = list(self.vote_rows.keys())
-            vote_items = list(votes.items())
+        if trusted:
+            self._log(f"[TRU]  🛡️  Trusted Publisher — inference skipped")
 
-            for idx, (model_key, data) in enumerate(vote_items):
-                delay  = 400 + idx * 250        # faster stagger reveal
-                vr_key = row_keys[idx] if idx < len(row_keys) else None
+        # ── Animate vote rows ─────────────────────────────────────────────
+        row_keys   = list(self.vote_rows.keys())
+        vote_items = list(votes.items())
+        total_delay = 200
 
-                # Log line
-                if data.get("status") == "SKIPPED":
-                    status = "SKIPPED"
-                    conf_str = "--.--%"
-                    icon = "⏭️"
-                    is_malware = False
-                    conf_float = 0.0
-                else:
-                    status = "MALWARE" if data["malware"] else "SAFE"
-                    conf_float = data["confidence"]
-                    conf_str = f'{conf_float * 100:.2f}%'
-                    icon = '🔴' if data["malware"] else '🟢'
-                    is_malware = bool(data["malware"])
-                    
-                line   = f"  {icon} [{model_key}] → {status}  ({conf_str})"
-                self._log(line, delay_ms=delay)
+        for idx, (model_key, data) in enumerate(vote_items):
+            delay  = 250 + idx * 200
+            vr_key = row_keys[idx] if idx < len(row_keys) else None
+            status = data.get("status", "")
 
-                # Animate vote row
+            if status == "TRUSTED":
+                icon, label = "🛡️", "TRUSTED"
+                self._log(f"  {icon}  [{model_key}] → {label}", delay_ms=delay)
                 if vr_key:
-                    if data.get("status") != "SKIPPED":
-                        self.vote_rows[vr_key].animate_result(
-                            is_malware, conf_float,
-                            delay_ms=delay + 100
-                        )
-
-            total_delay = 400 + len(vote_items) * 250 + 200
-            self._log(f"[*]  Scan completed in {elapsed:.2f}s.", delay_ms=total_delay)
-            self.after(total_delay, lambda: self.elapsed_lbl.configure(
-                text=f"Scan time: {elapsed:.2f} s"))
-
-            if verdict == "SAFE":
-                self.after(total_delay + 400, self._show_safe)
+                    self.vote_rows[vr_key].set_trusted(delay_ms=delay + 50)
+            elif status == "SKIPPED":
+                icon, label = "⏭️", "SKIPPED"
+                cov = data.get("match_ratio", 0) * 100
+                self._log(f"  {icon}  [{model_key}] → {label}  (coverage {cov:.0f}%)",
+                          delay_ms=delay)
+                if vr_key:
+                    self.vote_rows[vr_key].set_skipped(delay_ms=delay + 50)
             else:
-                self.after(total_delay + 400, self._show_malware)
+                conf = data.get("confidence", 0.0)
+                is_mal = bool(data.get("malware", False))
+                cov  = data.get("match_ratio", 1.0)
+                icon = "🔴" if is_mal else "🟢"
+                label= "MALWARE" if is_mal else "SAFE"
+                self._log(
+                    f"  {icon}  [{model_key}] → {label}  "
+                    f"(conf={conf*100:.1f}%, cov={cov*100:.0f}%)",
+                    delay_ms=delay
+                )
+                if vr_key:
+                    self.vote_rows[vr_key].animate_result(
+                        is_mal, conf, cov, delay_ms=delay + 80)
 
-            # Update counters
-            self._scan_count += 1
-            if verdict != "SAFE":
-                self._threat_count += 1
-            self.after(total_delay, lambda: self.card_scanned.update_value(
-                str(self._scan_count)))
-            self.after(total_delay, lambda: self.card_threats.update_value(
-                str(self._threat_count)))
+            total_delay = delay + 200
 
-        # ── Re-enable button after all animations settle ───────────────────
-        settle = total_delay + 800
-        self.after(settle, lambda: self.scan_btn.configure(
-            state="normal", text="▸  SELECT TARGET FILE"))
-        self.after(settle, lambda: self.dot.set_color(C["green"]))
-        self.after(settle, lambda: self.status_lbl.configure(
-            text="ONLINE", text_color=C["green"]))
-        self.after(settle, lambda: setattr(self, "is_scanning", False))
+        # ── Final log lines ───────────────────────────────────────────────
+        self._log(f"[*]  Fused score: {fused:.4f}", delay_ms=total_delay)
+        self._log(f"[*]  Reason: {reason}", delay_ms=total_delay + 50)
+        self._log(f"[*]  Scan completed in {elapsed:.2f}s", delay_ms=total_delay + 100)
+
+        settle = total_delay + 350
+
+        self.after(settle, lambda: self.elapsed_lbl.configure(
+            text=f"scan time: {elapsed:.2f}s"))
+
+        # Score display
+        score_color = C["red"] if verdict == "MALWARE" else C["green"]
+        self.after(settle, lambda: self.score_lbl.configure(
+            text=f"Score: {fused:.3f}", text_color=score_color))
+
+        # Reason display
+        self.after(settle, lambda: self.reason_lbl.configure(
+            text=reason, text_color=C["txt_sec"]))
+
+        # Verdict display
+        # Detect if this is a "SAFE via signature override" (models said MALWARE but sig wins)
+        active_malware_count = sum(
+            1 for v in votes.values()
+            if v.get("status") == "VOTED" and v.get("malware") is True
+        )
+        active_safe_count = sum(
+            1 for v in votes.values()
+            if v.get("status") == "VOTED" and v.get("malware") is False
+        )
+        sig_override = (verdict == "SAFE" and active_malware_count > 0
+                        and active_malware_count >= active_safe_count and is_signed)
+
+        if verdict == "SAFE" and sig_override:
+            self.after(settle + 100, self._show_safe_sig_override)
+        elif verdict == "SAFE":
+            self.after(settle + 100, self._show_safe)
+        elif verdict == "MALWARE":
+            self.after(settle + 100, self._show_malware)
+        else:
+            self.after(settle + 100, lambda: self.verdict_lbl.configure(
+                text="UNKNOWN", text_color=C["amber"]))
+
+        # Counters
+        self._scan_count += 1
+        if verdict == "MALWARE":
+            self._threat_count += 1
+        self.after(settle, lambda: self.card_scanned.update_value(str(self._scan_count)))
+        self.after(settle, lambda: self.card_threats.update_value(str(self._threat_count)))
+
+        # Re-enable button
+        final_settle = settle + 600
+        self.after(final_settle, lambda: self.scan_btn.configure(
+            state="normal", text="▸  SELECT FILE"))
+        self.after(final_settle, lambda: self.dot.set_color(C["green"]))
+        self.after(final_settle, lambda: self.status_lbl.configure(
+            text="ONLINE  ·  MONITORING", text_color=C["green"]))
+        self.after(final_settle, lambda: setattr(self, "is_scanning", False))
 
     # ────────────────────────────────────────────────────────────────────────
     #  VERDICT STATES
     # ────────────────────────────────────────────────────────────────────────
     def _show_safe(self):
-        filename = getattr(self, 'last_scanned_file', 'File')
+        filename = getattr(self, "last_scanned_file", "File")
         self.verdict_icon.configure(text="✓", text_color=C["green"])
-        self.verdict_lbl.configure(text="FILE IS SECURE", text_color=C["green"])
-        self._log("═══════════════════════════════════════════════════")
-        self._log("  LATE-FUSION VERDICT →  ✓  SAFE                  ")
-        self._log("═══════════════════════════════════════════════════")
+        self.verdict_lbl.configure(text="FILE IS SAFE", text_color=C["green"])
+        self._log("════════════════════════════════════════════════════")
+        self._log("  VERDICT  →  ✓  SAFE — no threat detected          ")
+        self._log("════════════════════════════════════════════════════")
         try:
-            notification.notify(title="IntelliGuard: Safe", message=f"{filename} is secure.", timeout=3)
+            notification.notify(title="IntelliGuard: SAFE",
+                                 message=f"{filename} passed all checks.",
+                                 timeout=3)
+        except Exception:
+            pass
+
+    def _show_safe_sig_override(self):
+        """SAFE verdict, but only because signature trust overrode suspicious model scores.
+        Show amber/yellow with a clear explanation — not green, not red."""
+        filename = getattr(self, "last_scanned_file", "File")
+        self.verdict_icon.configure(text="⚠", text_color=C["amber"])
+        self.verdict_lbl.configure(text="SAFE — SIG OVERRIDE", text_color=C["amber"])
+        self._log("════════════════════════════════════════════════════")
+        self._log("  VERDICT  →  ⚠  SAFE (Signature Override)          ")
+        self._log("  Models flagged as suspicious BUT CA signature      ")
+        self._log("  trust overrides — treat with caution.              ")
+        self._log("  Consider verifying the publisher independently.    ")
+        self._log("════════════════════════════════════════════════════")
+        try:
+            notification.notify(
+                title="IntelliGuard: Caution",
+                message=f"{filename}: Safe via signature — models were suspicious. Verify publisher.",
+                timeout=5)
         except Exception:
             pass
 
     def _show_malware(self):
-        filename = getattr(self, 'last_scanned_file', 'File')
+        filename = getattr(self, "last_scanned_file", "File")
         self.verdict_icon.configure(text="☠", text_color=C["red"])
         self.verdict_lbl.configure(text="THREAT DETECTED", text_color=C["red"])
-        self._log("═══════════════════════════════════════════════════")
-        self._log("  LATE-FUSION VERDICT →  ☠  MALWARE DETECTED       ")
-        self._log("  ⚠  IMMEDIATE QUARANTINE RECOMMENDED               ")
-        self._log("═══════════════════════════════════════════════════")
+        self._log("════════════════════════════════════════════════════")
+        self._log("  VERDICT  →  ☠  MALWARE DETECTED                   ")
+        self._log("  ⚠  DO NOT EXECUTE — QUARANTINE IMMEDIATELY         ")
+        self._log("════════════════════════════════════════════════════")
         try:
-            notification.notify(title="IntelliGuard: THREAT DETECTED", message=f"Malware found in {filename}!", timeout=5)
+            notification.notify(title="⚠ IntelliGuard: THREAT",
+                                 message=f"Malware detected in {filename}!",
+                                 timeout=6)
         except Exception:
             pass
 

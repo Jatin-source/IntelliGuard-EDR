@@ -6,6 +6,9 @@ import lief
 import pandas as pd
 from src.utils.logger import logger
 
+# Maximum bytes to read for string/entropy analysis (50 MB)
+_MAX_READ_BYTES = 50 * 1024 * 1024
+
 
 class PEFeatureExtractor:
     """Extracts PE features using LIEF, mapping them to Kaggle + EMBER column schemas."""
@@ -36,6 +39,14 @@ class PEFeatureExtractor:
             if binary is None:
                 return None
 
+            # ── Read raw bytes ONCE (capped at 50 MB) ─────────────────
+            file_size = os.path.getsize(self.file_path)
+            try:
+                with open(self.file_path, 'rb') as f:
+                    raw_bytes = f.read(_MAX_READ_BYTES)
+            except Exception:
+                raw_bytes = b''
+
             features = {}
 
             # ==========================================
@@ -48,9 +59,9 @@ class PEFeatureExtractor:
             # ==========================================
             self._extract_ember_headers(binary, features)
             self._extract_ember_authenticode(binary, features)
-            self._extract_ember_general(binary, features)
-            self._extract_ember_sections(binary, features)
-            self._extract_ember_strings(binary, features)
+            self._extract_ember_general(binary, features, raw_bytes, file_size)
+            self._extract_ember_sections(binary, features, file_size)
+            self._extract_ember_strings(features, raw_bytes)
             self._extract_ember_imports(binary, features)
 
             # ==========================================
@@ -218,25 +229,19 @@ class PEFeatureExtractor:
             features['authenticode.no_countersigner'] = 1
 
     # -------------------------------------------------------
-    # EMBER: General file properties
+    # EMBER: General file properties  (uses shared raw_bytes)
     # -------------------------------------------------------
-    def _extract_ember_general(self, binary, features):
-        file_size = os.path.getsize(self.file_path)
+    def _extract_ember_general(self, binary, features, raw_bytes: bytes, file_size: int):
         features['general.size'] = file_size
         features['general.is_pe'] = 1
 
-        # Compute overall file entropy
-        try:
-            with open(self.file_path, 'rb') as f:
-                data = f.read()
-            if data:
-                counts = Counter(data)
-                length = len(data)
-                entropy = sum(- (count / length) * math.log2(count / length) for count in counts.values())
-                features['general.entropy'] = entropy
-            else:
-                features['general.entropy'] = 0.0
-        except Exception:
+        # Compute overall file entropy from shared buffer
+        if raw_bytes:
+            counts = Counter(raw_bytes)
+            length = len(raw_bytes)
+            entropy = sum(-(count / length) * math.log2(count / length) for count in counts.values())
+            features['general.entropy'] = entropy
+        else:
             features['general.entropy'] = 0.0
 
         # Start bytes (first 2 bytes as integer — magic number)
@@ -245,35 +250,30 @@ class PEFeatureExtractor:
     # -------------------------------------------------------
     # EMBER: Section & Overlay info
     # -------------------------------------------------------
-    def _extract_ember_sections(self, binary, features):
+    def _extract_ember_sections(self, binary, features, file_size: int):
         features['section.sections'] = len(binary.sections)
 
         overlay_data = binary.overlay if binary.overlay else b''
         overlay_size = len(overlay_data)
         features['section.overlay.size'] = overlay_size
-
-        file_size = os.path.getsize(self.file_path)
         features['section.overlay.size_ratio'] = overlay_size / file_size if file_size > 0 else 0.0
 
         # Overlay entropy
         if overlay_data and overlay_size > 0:
             counts = Counter(overlay_data)
-            entropy = sum(- (count / overlay_size) * math.log2(count / overlay_size) for count in counts.values())
+            entropy = sum(-(count / overlay_size) * math.log2(count / overlay_size) for count in counts.values())
             features['section.overlay.entropy'] = entropy
         else:
             features['section.overlay.entropy'] = 0.0
 
     # -------------------------------------------------------
-    # EMBER: String-based features
+    # EMBER: String-based features  (uses shared raw_bytes)
     # -------------------------------------------------------
-    def _extract_ember_strings(self, binary, features):
+    def _extract_ember_strings(self, features, raw_bytes: bytes):
         """Extract printable strings and count suspicious patterns."""
         try:
-            with open(self.file_path, 'rb') as f:
-                raw = f.read()
-
             # Fast extract ASCII printable strings (min length 4)
-            strings_b = re.findall(b'[ -~]{4,}', raw)
+            strings_b = re.findall(b'[ -~]{4,}', raw_bytes)
             strings = [s.decode('ascii', errors='ignore') for s in strings_b]
 
             features['strings.numstrings'] = len(strings)
@@ -288,13 +288,14 @@ class PEFeatureExtractor:
                 if all_chars:
                     counts = Counter(all_chars)
                     total = len(all_chars)
-                    entropy = sum(- (count / total) * math.log2(count / total) for count in counts.values())
+                    entropy = sum(-(count / total) * math.log2(count / total) for count in counts.values())
                     features['strings.entropy'] = entropy
                 else:
                     features['strings.entropy'] = 0.0
 
-                # Printable character distribution (ratio of printable chars to file size)
-                features['strings.printabledist'] = features['strings.printables'] / len(raw) if raw else 0.0
+                # Printable character distribution
+                raw_len = len(raw_bytes) if raw_bytes else 1
+                features['strings.printabledist'] = features['strings.printables'] / raw_len
             else:
                 features['strings.avlength'] = 0.0
                 features['strings.entropy'] = 0.0
