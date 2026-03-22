@@ -4,31 +4,20 @@ import time
 import pandas as pd
 import xgboost as xgb
 from pathlib import Path
-
-# Ensure project root is on sys.path
 _project_root = str(Path(__file__).resolve().parent.parent.parent)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
-
 from src.utils.logger import logger
 from src.features.pe_extractor import PEFeatureExtractor
-
-# ── Configuration ─────────────────────────────────────────────────────────
-MIN_MATCH_RATIO = 0.05  # Lowered slightly so models can vote, but NO model gets to vote blind.
-
-# ── EXPERT AUTHORITY WEIGHTS ──────────────────────────────────────────────
+MIN_MATCH_RATIO = 0.05  
 EXPERT_AUTHORITY = {
     'EMBER': 2.5,   
     'BODMAS': 1.5,  
     'Kaggle': 0.8   
 }
-
-# ── Strict Decision Thresholds ────────────────────────────────────────────
 UNSIGNED_THRESHOLD = 0.65
 SELF_SIGNED_THRESHOLD = 0.75
 CA_SIGNED_THRESHOLD = 0.88
-
-# ── Trusted Publishers & Directories (Auto-Safe) ──────────────────────────
 TRUSTED_PUBLISHERS = [
     'microsoft', 'google', 'mozilla', 'apple', 'adobe', 'intel', 'nvidia',
     'advanced micro devices', 'oracle', 'vmware', 'citrix', 'cisco',
@@ -39,9 +28,8 @@ TRUSTED_PUBLISHERS = [
     'bitdefender', 'norton', 'slack', 'zoom', 'discord', 'spotify', 'dropbox',
     'github', 'jetbrains', 'notepad++', 'wireshark', 'videolan', 'audacity',
     '7-zip', 'winrar', 'rarlab', 'dotnet', 'open source developer', 'apache',
-    'vs revo group' # Added Revo Uninstaller
+    'vs revo group' 
 ]
-
 TRUSTED_SYSTEM_DIRS = [
     os.path.normcase(os.path.expandvars(p)) for p in [
         r'%SystemRoot%\System32', r'%SystemRoot%\SysWOW64', r'%SystemRoot%\WinSxS',
@@ -50,14 +38,11 @@ TRUSTED_SYSTEM_DIRS = [
         r'%ProgramFiles%', r'%ProgramFiles(x86)%', r'%ProgramW6432%',
     ]
 ]
-
-
 class IntelliGuardEnsemble:
     def __init__(self):
         logger.info("Waking up IntelliGuard AI Ensemble...")
         self.models = {}
         self._load_models()
-
     def _load_models(self):
         model_paths = {
             'Kaggle': Path("outputs/models/expert_kaggle.json"),
@@ -72,15 +57,11 @@ class IntelliGuardEnsemble:
                 logger.info(f"✅ {name} Expert loaded successfully. (Base Weight: {EXPERT_AUTHORITY.get(name, 1.0)}x)")
             else:
                 logger.error(f"❌ {name} Expert missing at {path}")
-
     def _is_trusted_publisher(self, signer: str) -> bool:
         signer_lower = signer.lower()
         return any(pub in signer_lower for pub in TRUSTED_PUBLISHERS)
-
     def scan_file(self, file_path):
         logger.info(f"Analyzing target: {file_path}")
-
-        # ── Feature Extraction ────────────────────────────────────────────
         raw_features = None
         for i in range(3):
             try:
@@ -92,100 +73,71 @@ class IntelliGuardEnsemble:
                 if i == 2:
                     return {"status": "error", "message": "File is busy or locked by the OS."}
             time.sleep(1.0)
-
         if raw_features is None:
             return {"status": "error", "message": "Failed to extract PE features."}
-
         extracted_cols = set(raw_features.columns)
-
-        # ── Digital Signature Check ───────────────────────────────────────
         is_signed = False
         signer = ""
         if '_meta.is_validly_signed' in raw_features.columns:
             is_signed = bool(raw_features['_meta.is_validly_signed'].iloc[0])
         if '_meta.signer_subject' in raw_features.columns:
             signer = str(raw_features['_meta.signer_subject'].iloc[0])
-
         if is_signed:
             logger.info(f"🔏 Valid digital signature detected: {signer}")
         else:
             logger.info("⚠️ No valid digital signature found.")
-
-        # ── Fast Path: Trusted Publisher ──────────────────────────────────
         if is_signed and signer and self._is_trusted_publisher(signer):
             logger.info(f"🛡️ TRUSTED PUBLISHER: {signer} — auto-verdict: SAFE")
             votes = {name: {"malware": False, "confidence": 0.0, "status": "TRUSTED", "match_ratio": 1.0} for name in self.models}
             return self._build_result("SAFE", 0.0, is_signed, signer, votes, 0, f"Trusted Publisher: {signer}")
-
-        # ── Fast Path: System Directory ───────────────────────────────────
         resolved = os.path.normcase(os.path.realpath(file_path))
         if any(resolved.startswith(sd) for sd in TRUSTED_SYSTEM_DIRS):
             dir_match = next(sd for sd in TRUSTED_SYSTEM_DIRS if resolved.startswith(sd))
             logger.info(f"🛡️ SYSTEM DIRECTORY: {dir_match} — auto-verdict: SAFE")
             votes = {name: {"malware": False, "confidence": 0.0, "status": "TRUSTED", "match_ratio": 1.0} for name in self.models}
             return self._build_result("SAFE", 0.0, is_signed, f"OS System ({os.path.basename(dir_match)})", votes, 0, f"System Directory: {dir_match}")
-
-        # ── Model Inference ───────────────────────────────────────────────
         votes = {}
         weighted_scores = []
         malware_votes = 0
         safe_votes = 0
         participating_experts = 0
-
         for name, model in self.models.items():
             expected_cols = model.feature_names
             matched = extracted_cols.intersection(expected_cols)
             match_ratio = len(matched) / len(expected_cols) if expected_cols else 0
-
-            # BUG FIX: No model is exempt from the threshold. If cov=0%, it skips.
             if match_ratio < MIN_MATCH_RATIO:
                 logger.warning(f"[{name}] ⏭️ SKIPPED — {match_ratio*100:.1f}% coverage is too low.")
                 votes[name] = {"malware": None, "confidence": None, "status": "SKIPPED", "match_ratio": match_ratio}
                 continue
-
             participating_experts += 1
             model_features = raw_features.drop(columns=[c for c in raw_features.columns if c.startswith('_meta.')], errors='ignore')
             aligned_df = model_features.reindex(columns=expected_cols, fill_value=0.0).astype('float32')
-            
-            # Predict
             dmatrix = xgb.DMatrix(aligned_df)
             prob = float(model.predict(dmatrix)[0])
             is_malware = prob > 0.5
-
             if is_malware:
                 malware_votes += 1
             else:
                 safe_votes += 1
-
             votes[name] = {
                 "malware": bool(is_malware),
                 "confidence": prob,
                 "status": "VOTED",
                 "match_ratio": match_ratio
             }
-
-            # BUG FIX: Weight now scales exactly with coverage. 
             authority = EXPERT_AUTHORITY.get(name, 1.0)
             weight = authority * match_ratio  
             weighted_scores.append((prob, weight))
-
             status = "🚨 MALWARE" if is_malware else "✅ SAFE"
             logger.info(f"[{name}] {status} (Prob: {prob:.4f}, Cov: {match_ratio*100:.1f}%, Final Weight: {weight:.2f})")
-
-        # ── Fused Verdict Logic ───────────────────────────────────────────
         if participating_experts == 0:
             return self._build_result("UNKNOWN", 0.0, is_signed, signer, votes, 0, "No experts had enough feature coverage")
-
         total_weight = sum(w for _, w in weighted_scores)
         fused_score = sum(p * w for p, w in weighted_scores) / total_weight if total_weight > 0 else 0.0
         majority_malware = malware_votes > safe_votes
-
         logger.info(f"[FUSION] Weighted Score: {fused_score:.4f} (Malware Votes: {malware_votes}, Safe Votes: {safe_votes})")
-
-        # The 110% Absolute Math Rules:
         if is_signed:
             is_self_signed = bool(raw_features.get('authenticode.self_signed', [0])[0])
-            
             if is_self_signed:
                 if fused_score >= SELF_SIGNED_THRESHOLD and majority_malware:
                     final_verdict = "MALWARE"
@@ -194,7 +146,6 @@ class IntelliGuardEnsemble:
                     final_verdict = "SAFE"
                     reason = f"Self-Signed Safe (Failed threshold or majority)"
             else:
-                # BUG FIX: CA Signed - Must be UNANIMOUS among AT LEAST 2 models to override
                 if fused_score >= CA_SIGNED_THRESHOLD and malware_votes == participating_experts and participating_experts >= 2:
                     final_verdict = "MALWARE"
                     reason = f"CA-Signed Threat Override (Unanimous [{participating_experts} experts] + Score {fused_score:.3f} >= {CA_SIGNED_THRESHOLD})"
@@ -205,16 +156,13 @@ class IntelliGuardEnsemble:
                     else:
                          reason = "CA-Signed Safe (Signature prevailed over ML doubts)"
         else:
-            # Unsigned
             if fused_score >= UNSIGNED_THRESHOLD and majority_malware:
                 final_verdict = "MALWARE"
                 reason = f"Unsigned Threat (Score {fused_score:.3f} >= {UNSIGNED_THRESHOLD} & Majority Agreed)"
             else:
                 final_verdict = "SAFE"
                 reason = f"Unsigned Safe (Failed threshold {UNSIGNED_THRESHOLD} or majority)"
-
         return self._build_result(final_verdict, fused_score, is_signed, signer, votes, participating_experts, reason)
-
     def _build_result(self, verdict, score, is_signed, signer, votes, experts, reason):
         logger.info("=" * 60)
         logger.info(f"{'🚨' if verdict == 'MALWARE' else '✅'} FINAL VERDICT: {verdict}")
@@ -231,7 +179,6 @@ class IntelliGuardEnsemble:
             "participating_experts": experts,
             "verdict_reason": reason,
         }
-
 if __name__ == "__main__":
     engine = IntelliGuardEnsemble()
     test_target = sys.argv[1] if len(sys.argv) > 1 else sys.executable
