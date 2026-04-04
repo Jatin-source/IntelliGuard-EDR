@@ -22,3 +22,10 @@ test_output.txt
 # OS
 .DS_Store
 Thumbs.db
+
+# Local Debug & Temporary Files
+status*.txt
+debug_json.py
+test_graph.py
+error.txt
+models/*.json
