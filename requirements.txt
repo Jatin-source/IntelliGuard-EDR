@@ -23,3 +23,8 @@ python-dotenv
 pyarrow
 fastparquet
 psutil
+
+# GUI & System Utilities
+customtkinter
+plyer
+lief

@@ -421,8 +421,12 @@ class IntelliGuardApp(ctk.CTk):
         self.resizable(True, True)
         self.configure(fg_color=C["bg_deep"])
 
-        # Taskbar / title-bar icon (wm_iconphoto works reliably for taskbar)
-        if os.path.isfile(self._LOGO_PNG):
+        # Window & taskbar icon
+        # On Windows, iconbitmap with a multi-size .ico gives the crispest result
+        # at all sizes (title bar, taskbar, Alt-Tab). wm_iconphoto can conflict.
+        if os.name == 'nt' and os.path.isfile(self._LOGO_ICO):
+            self.iconbitmap(self._LOGO_ICO)
+        elif os.path.isfile(self._LOGO_PNG):
             from PIL import ImageTk
             _icon_img = PILImage.open(self._LOGO_PNG).convert("RGBA")
             self._taskbar_icon = ImageTk.PhotoImage(_icon_img.resize((64, 64), PILImage.LANCZOS))
@@ -498,7 +502,7 @@ class IntelliGuardApp(ctk.CTk):
         # App logo from image file
         if os.path.isfile(self._LOGO_PNG):
             _logo_pil = PILImage.open(self._LOGO_PNG).convert("RGBA")
-            self._logo_img = ctk.CTkImage(light_image=_logo_pil, dark_image=_logo_pil, size=(36, 36))
+            self._logo_img = ctk.CTkImage(light_image=_logo_pil, dark_image=_logo_pil, size=(48, 48))
             ctk.CTkLabel(brand_frame, image=self._logo_img, text="").pack(side="left", padx=(0, 8))
         else:
             ctk.CTkLabel(brand_frame, text="🛡", font=ctk.CTkFont(size=22), text_color=C["accent"]).pack(side="left", padx=(0, 6))
@@ -915,6 +919,9 @@ class IntelliGuardApp(ctk.CTk):
         popup.transient(self)
         popup.grab_set()
         popup.resizable(False, False)
+        # Set popup title-bar icon
+        if os.path.isfile(self._LOGO_ICO):
+            popup.after(200, lambda: popup.iconbitmap(self._LOGO_ICO))
         popup.update_idletasks()
         x = self.winfo_x() + (self.winfo_width() - width) // 2
         y = self.winfo_y() + (self.winfo_height() - height) // 2

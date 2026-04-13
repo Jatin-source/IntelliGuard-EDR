@@ -29,7 +29,8 @@ def process_cic_dynamic():
         file_hash = str(row['hash'])
         if file_hash in pt_dict:
             try:
-                tensor = torch.load(pt_dict[file_hash], weights_only=False, map_location=torch.device('cpu'))
+                device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                tensor = torch.load(pt_dict[file_hash], weights_only=False, map_location=device)
                 if hasattr(tensor, 'x') and tensor.x is not None:
                     arr = tensor.x.detach().cpu().numpy()
                 elif isinstance(tensor, torch.Tensor):
